@@ -52,6 +52,11 @@
     .upload-box:hover { border-color: var(--primary); background: #f0f7ff; }
     .upload-box input { display: none; }
     .upload-box span { font-size: 11px; font-weight: 700; color: var(--dark); display: block; margin-top: 4px; }
+
+    .pdf-status { min-height: 16px; margin: -7px 2px 12px; color: var(--muted); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+    .pdf-status.success { color: #15803d; }
+    .pdf-status.error { color: var(--danger); }
+    .pdf-status.loading { color: var(--primary); }
     
     .preview-section { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; display: flex; flex-direction: column; align-items: center; }
     
@@ -102,8 +107,9 @@
     <label class="upload-box">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#0072CE" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
         <span>Upload PDF Receipt (Fully Dynamic)</span>
-        <input type="file" id="pdfFileInput" accept="application/pdf" onchange="handlePdfUpload(event)">
+        <input type="file" id="pdfFileInput" accept="application/pdf,.pdf" onchange="handlePdfUpload(event)">
     </label>
+    <p id="pdfStatus" class="pdf-status" role="status" aria-live="polite">Upload a PDF with selectable text. Scanned image-only PDFs need OCR before their text can be edited.</p>
 
     <div class="preview-section">
         <span style="font-size: 9px; font-weight: 800; color: var(--muted); text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px;">Receipt Inspection & Editor Window</span>
@@ -118,7 +124,9 @@
 </div>
 
 <script>
-pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+if (typeof pdfjsLib !== "undefined" && pdfjsLib.GlobalWorkerOptions) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+}
 
 let bluetoothDevice = null;
 let bluetoothCharacteristic = null;
@@ -140,69 +148,168 @@ async function checkRememberedPrinter() {
     }
 }
 
-async function handlePdfUpload(event) {
-    const file = event.target.files[0];
-    if (!file) return;
+function setPdfStatus(message, state = "") {
+    const status = document.getElementById("pdfStatus");
+    if (!status) return;
+    status.textContent = message;
+    status.className = `pdf-status ${state}`.trim();
+}
 
-    const reader = new FileReader();
-    reader.onload = async function() {
-        try {
-            const typedarray = new Uint8Array(this.result);
-            const loadingTask = pdfjsLib.getDocument({ data: typedarray });
-            const pdfDoc = await loadingTask.promise;
-            
-            let allTextLines = [];
-            for (let i = 1; i <= pdfDoc.numPages; i++) {
-                const page = await pdfDoc.getPage(i);
-                const textContent = await page.getTextContent();
-                
-                if (textContent.items && textContent.items.length > 0) {
-                    // Map items with coordinates
-                    let items = textContent.items.map(item => ({
-                        text: item.str.trim(),
-                        x: item.transform[4],
-                        y: item.transform[5]
-                    })).filter(i => i.text.length > 0);
+function reconstructPdfText(textContent) {
+    const sourceItems = Array.isArray(textContent?.items) ? textContent.items : [];
+    const positionedItems = [];
+    const fallbackItems = [];
 
-                    // Sort items strictly top-to-bottom (descending Y) then left-to-right (ascending X)
-                    items.sort((a, b) => {
-                        if (Math.abs(b.y - a.y) > 4) {
-                            return b.y - a.y;
-                        }
-                        return a.x - b.x;
-                    });
-                    
-                    let currentLineY = null;
-                    let lineBuffer = [];
-                    
-                    items.forEach(item => {
-                        if (currentLineY === null || Math.abs(item.y - currentLineY) > 4) {
-                            if (lineBuffer.length > 0) {
-                                allTextLines.push(lineBuffer.join(' '));
-                                lineBuffer = [];
-                            }
-                            currentLineY = item.y;
-                        }
-                        lineBuffer.push(item.text);
-                    });
-                    if (lineBuffer.length > 0) {
-                        allTextLines.push(lineBuffer.join(' '));
-                    }
+    for (const source of sourceItems) {
+        // PDF.js may include marked-content records alongside text items. They
+        // have no `str` or transform, so ignore them rather than aborting upload.
+        if (typeof source?.str !== "string") continue;
+        const text = source.str.replace(/\r?\n/g, " ").replace(/\u00a0/g, " ").trim();
+        if (!text) continue;
+
+        const transform = source.transform;
+        const x = Number(transform?.[4]);
+        const y = Number(transform?.[5]);
+        const matrixFontSize = Math.hypot(Number(transform?.[0]) || 0, Number(transform?.[1]) || 0);
+        const fontSize = matrixFontSize || Math.abs(Number(source.height)) || 10;
+
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+            positionedItems.push({
+                text,
+                x,
+                y,
+                width: Number(source.width),
+                fontSize
+            });
+        } else {
+            fallbackItems.push(text);
+        }
+    }
+
+    if (positionedItems.length === 0) {
+        return fallbackItems.length ? [fallbackItems.join(" ")] : [];
+    }
+
+    // Sort by exact coordinates first. A tolerance in the comparator is
+    // non-transitive and can move columns between rows unpredictably.
+    positionedItems.sort((a, b) => b.y - a.y || a.x - b.x);
+    const rows = [];
+
+    for (const item of positionedItems) {
+        let bestRow = null;
+        let bestDistance = Infinity;
+        for (const row of rows) {
+            const distance = Math.abs(row.y - item.y);
+            const tolerance = Math.max(1.25, Math.min(row.fontSize, item.fontSize) * 0.3);
+            if (distance <= tolerance && distance < bestDistance) {
+                bestRow = row;
+                bestDistance = distance;
+            }
+        }
+
+        if (!bestRow) {
+            rows.push({ y: item.y, fontSize: item.fontSize, count: 1, items: [item] });
+        } else {
+            bestRow.items.push(item);
+            bestRow.y = (bestRow.y * bestRow.count + item.y) / (bestRow.count + 1);
+            bestRow.fontSize = (bestRow.fontSize * bestRow.count + item.fontSize) / (bestRow.count + 1);
+            bestRow.count += 1;
+        }
+    }
+
+    rows.sort((a, b) => b.y - a.y);
+    const lines = rows.map(row => {
+        row.items.sort((a, b) => a.x - b.x);
+        let line = "";
+        let previousRight = null;
+        let previousFontSize = 10;
+
+        for (const item of row.items) {
+            if (previousRight !== null) {
+                const gap = item.x - previousRight;
+                const spaceWidth = Math.max(1.5, ((previousFontSize + item.fontSize) / 2) * 0.25);
+                if (gap > spaceWidth * 0.55) {
+                    const spaces = Math.min(32, Math.max(1, Math.round(gap / spaceWidth)));
+                    line += " ".repeat(spaces);
                 }
             }
 
-            const finalString = allTextLines.join('\n');
-            if (finalString.trim()) {
-                document.getElementById('receiptEditor').value = finalString;
-            } else {
-                alert("The PDF parser could not detect text blocks. Ensure your PDF has selectable text.");
-            }
-        } catch (error) {
-            console.error("PDF Parsing error:", error);
-            alert("Error reading PDF file: " + (error.message || error));
+            line += item.text;
+            const measuredWidth = Number.isFinite(item.width) && item.width > 0
+                ? item.width
+                : item.text.length * item.fontSize * 0.5;
+            previousRight = Math.max(previousRight ?? -Infinity, item.x + measuredWidth);
+            previousFontSize = item.fontSize;
         }
-    };
-    reader.readAsArrayBuffer(file);
+
+        return line.trimEnd();
+    }).filter(Boolean);
+
+    // Keep readable content even if a PDF has some text records without
+    // coordinates, instead of throwing or silently losing those records.
+    if (fallbackItems.length) lines.push(fallbackItems.join(" "));
+    return lines;
+}
+
+async function handlePdfUpload(event) {
+    const input = event?.currentTarget || event?.target || document.getElementById("pdfFileInput");
+    const file = input?.files?.[0];
+    if (!file) return;
+
+    let loadingTask = null;
+    let pdfDoc = null;
+    if (input) input.disabled = true;
+    setPdfStatus(`Reading ${file.name || "PDF"}…`, "loading");
+
+    try {
+        if (typeof pdfjsLib === "undefined" || typeof pdfjsLib.getDocument !== "function") {
+            throw new Error("The PDF reader did not load. Check your connection and reload the page.");
+        }
+        if (typeof file.arrayBuffer !== "function") {
+            throw new Error("This browser cannot read the selected file. Try a current version of Chrome or Edge.");
+        }
+
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        if (!bytes.length) throw new Error("The selected file is empty.");
+
+        loadingTask = pdfjsLib.getDocument({ data: bytes });
+        pdfDoc = await loadingTask.promise;
+        if (!Number.isInteger(pdfDoc.numPages) || pdfDoc.numPages < 1) {
+            throw new Error("The PDF has no readable pages.");
+        }
+
+        const pages = [];
+        for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber++) {
+            const page = await pdfDoc.getPage(pageNumber);
+            const textContent = await page.getTextContent();
+            const pageLines = reconstructPdfText(textContent);
+            if (pageLines.length) pages.push(pageLines.join("\n"));
+            page.cleanup?.();
+        }
+
+        const extractedText = pages.join("\n\n").trim();
+        if (!extractedText) {
+            throw new Error("No selectable text was found. This may be a scanned/image-only PDF; run OCR on it first.");
+        }
+
+        document.getElementById("receiptEditor").value = extractedText;
+        setPdfStatus(`Loaded ${file.name || "PDF"} (${pdfDoc.numPages} page${pdfDoc.numPages === 1 ? "" : "s"}). Review the text before printing.`, "success");
+    } catch (error) {
+        console.error("PDF parsing error:", error);
+        const detail = error?.message || String(error) || "Unknown error";
+        setPdfStatus(`Could not read ${file.name || "PDF"}: ${detail}`, "error");
+    } finally {
+        try {
+            if (pdfDoc?.destroy) await pdfDoc.destroy();
+            else if (loadingTask?.destroy) await loadingTask.destroy();
+        } catch (cleanupError) {
+            console.warn("Could not release PDF reader resources:", cleanupError);
+        }
+        if (input) {
+            input.value = "";
+            input.disabled = false;
+        }
+    }
 }
 
 window.connectBluetoothPrinter = async () => {
