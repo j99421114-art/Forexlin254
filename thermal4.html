@@ -6,6 +6,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <!-- PDF.js for parsing PDF files -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<!-- Tesseract.js OCR fallback for scanned/image-only receipt pages -->
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
     :root { 
@@ -109,7 +111,7 @@
         <span>Upload PDF Receipt (Fully Dynamic)</span>
         <input type="file" id="pdfFileInput" accept="application/pdf,.pdf" onchange="handlePdfUpload(event)">
     </label>
-    <p id="pdfStatus" class="pdf-status" role="status" aria-live="polite">Upload a PDF with selectable text. Scanned image-only PDFs need OCR before their text can be edited.</p>
+    <p id="pdfStatus" class="pdf-status" role="status" aria-live="polite">Selectable text is extracted directly. Scanned pages use OCR in this browser; review the result before printing.</p>
 
     <div class="preview-section">
         <span style="font-size: 9px; font-weight: 800; color: var(--muted); text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px;">Receipt Inspection & Editor Window</span>
@@ -258,6 +260,8 @@ async function handlePdfUpload(event) {
 
     let loadingTask = null;
     let pdfDoc = null;
+    let ocrWorker = null;
+    let activeOcrPage = 0;
     if (input) input.disabled = true;
     setPdfStatus(`Reading ${file.name || "PDF"}…`, "loading");
 
@@ -279,26 +283,94 @@ async function handlePdfUpload(event) {
         }
 
         const pages = [];
+        const ocrPageNumbers = [];
+        const emptyOcrPageNumbers = [];
+        const getOcrWorker = async () => {
+            if (ocrWorker) return ocrWorker;
+            if (!window.Tesseract || typeof window.Tesseract.createWorker !== "function") {
+                throw new Error("The OCR engine did not load. Check your connection and reload the page.");
+            }
+
+            ocrWorker = await window.Tesseract.createWorker("eng", 1, {
+                logger: message => {
+                    if (!message?.status) return;
+                    const progress = Number.isFinite(message.progress)
+                        ? ` ${Math.round(message.progress * 100)}%`
+                        : "";
+                    const pageLabel = activeOcrPage
+                        ? ` page ${activeOcrPage} of ${pdfDoc.numPages}`
+                        : "";
+                    setPdfStatus(`OCR${pageLabel}: ${message.status}${progress}`, "loading");
+                }
+            });
+            await ocrWorker.setParameters?.({ preserve_interword_spaces: "1" });
+            return ocrWorker;
+        };
+
         for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber++) {
             const page = await pdfDoc.getPage(pageNumber);
             const textContent = await page.getTextContent();
-            const pageLines = reconstructPdfText(textContent);
-            if (pageLines.length) pages.push(pageLines.join("\n"));
+            let pageText = reconstructPdfText(textContent).join("\n").trim();
+
+            if (!pageText) {
+                activeOcrPage = pageNumber;
+                ocrPageNumbers.push(pageNumber);
+                setPdfStatus(`Scanned page ${pageNumber} of ${pdfDoc.numPages}: preparing in-browser OCR…`, "loading");
+                const worker = await getOcrWorker();
+                const viewportAtScaleOne = page.getViewport({ scale: 1 });
+                const basePixelCount = Math.max(1, viewportAtScaleOne.width * viewportAtScaleOne.height);
+                const renderScale = Math.min(2.5, Math.sqrt(6000000 / basePixelCount));
+                const viewport = page.getViewport({ scale: renderScale });
+                const canvas = document.createElement("canvas");
+
+                try {
+                    canvas.width = Math.ceil(viewport.width);
+                    canvas.height = Math.ceil(viewport.height);
+                    const canvasContext = canvas.getContext("2d", { alpha: false });
+                    if (!canvasContext) throw new Error("This browser could not prepare a page for OCR.");
+
+                    await page.render({
+                        canvasContext,
+                        viewport,
+                        background: "rgb(255, 255, 255)"
+                    }).promise;
+
+                    const result = await worker.recognize(canvas);
+                    pageText = String(result?.data?.text || "").trim();
+                    if (!pageText) emptyOcrPageNumbers.push(pageNumber);
+                } finally {
+                    canvas.width = 0;
+                    canvas.height = 0;
+                }
+            }
+
+            if (pageText) pages.push(pageText);
             page.cleanup?.();
         }
 
         const extractedText = pages.join("\n\n").trim();
         if (!extractedText) {
-            throw new Error("No selectable text was found. This may be a scanned/image-only PDF; run OCR on it first.");
+            throw new Error("No readable text was detected, even after OCR. Check that the PDF is clear and not blank.");
         }
 
         document.getElementById("receiptEditor").value = extractedText;
-        setPdfStatus(`Loaded ${file.name || "PDF"} (${pdfDoc.numPages} page${pdfDoc.numPages === 1 ? "" : "s"}). Review the text before printing.`, "success");
+        const ocrSummary = ocrPageNumbers.length
+            ? ` OCR was used on ${ocrPageNumbers.length} scanned page${ocrPageNumbers.length === 1 ? "" : "s"}.`
+            : "";
+        const missedPagesSummary = emptyOcrPageNumbers.length
+            ? ` No text was recognized on page${emptyOcrPageNumbers.length === 1 ? "" : "s"} ${emptyOcrPageNumbers.join(", ")}.`
+            : "";
+        setPdfStatus(`Loaded ${file.name || "PDF"} (${pdfDoc.numPages} page${pdfDoc.numPages === 1 ? "" : "s"}).${ocrSummary}${missedPagesSummary} Review the text before printing.`, "success");
     } catch (error) {
         console.error("PDF parsing error:", error);
         const detail = error?.message || String(error) || "Unknown error";
         setPdfStatus(`Could not read ${file.name || "PDF"}: ${detail}`, "error");
     } finally {
+        try {
+            if (ocrWorker?.terminate) await ocrWorker.terminate();
+        } catch (cleanupError) {
+            console.warn("Could not stop OCR worker:", cleanupError);
+        }
         try {
             if (pdfDoc?.destroy) await pdfDoc.destroy();
             else if (loadingTask?.destroy) await loadingTask.destroy();
